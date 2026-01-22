@@ -7,30 +7,136 @@ param(
     [ValidateSet("update", "status", "merge", "sync", "amend", "help")]
     [string]$Command = "help",
     
-    [Parameter(Position = 1)]
+    # NOTE: This used to be Position=1, but PowerShell treats GNU-style flags like `--no-rebase`
+    # as plain arguments; with a positional Count that caused confusing type conversion errors.
     [uint]$Count = 0,
     
     [string[]]$Reviewer = @(),
     
     [switch]$Detail,
-    [switch]$NoRebase
+    [switch]$NoRebase,
+
+    # Non-interactive support for `amend` (1-based index in displayed list).
+    # Example: .\git-spr.ps1 amend --amend-index 2
+    [uint]$AmendIndex = 0,
+
+    # Catch-all for GNU-style flags like `--count`, `--no-rebase`, etc.
+    # We parse these ourselves in Resolve-LongOptions.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$RemainingArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
 
 # Configuration
 $Config = @{
-    GitHubRemote = "origin"
-    GitHubBranch = "main"
-    GitHubHost = "github.com"
-    RequireChecks = $true
-    RequireApproval = $true
-    MergeMethod = "rebase"
-    ShowPRLink = $true
-    LogGitCommands = $true
-    LogGitHubCalls = $true
+    GitHubRemote     = "origin"
+    GitHubBranch     = "main"
+    GitHubHost       = "github.com"
+    RequireChecks    = $true
+    RequireApproval  = $true
+    MergeMethod      = "rebase"
+    ShowPRLink       = $true
+    LogGitCommands   = $true
+    LogGitHubCalls   = $true
     StatusBitsEmojis = $true
     StatusBitsHeader = $true
+}
+
+function Resolve-LongOptions {
+    <#
+    PowerShell scripts don’t natively support `--flag` / `--flag=value` style options.
+    The README uses GNU-style flags, so we parse any *unbound* args here.
+
+    This keeps PowerShell-native usage working:
+      .\git-spr.ps1 update -Count 2 -Reviewer foo -NoRebase
+
+    And also supports:
+      .\git-spr.ps1 update --count 2 --reviewer foo --no-rebase
+    #>
+    param([string[]]$UnboundArgs)
+
+    if (-not $UnboundArgs -or $UnboundArgs.Count -eq 0) { return }
+
+    for ($i = 0; $i -lt $UnboundArgs.Count; $i++) {
+        $arg = $UnboundArgs[$i]
+        if (-not $arg) { continue }
+
+        # Normalize GNU-style args:
+        # - treat `--foo` the same as `-foo`
+        # - be case-insensitive
+        $norm = $arg.Trim()
+        if ($norm.StartsWith('--')) {
+            $norm = '-' + $norm.Substring(2)
+        }
+        $normLower = $norm.ToLowerInvariant()
+
+        # Allow `update 2` as shorthand count (only if Count not already set)
+        if ($normLower -match '^\d+$' -and $script:Count -eq 0) {
+            $script:Count = [uint]$normLower
+            continue
+        }
+
+        # --count / --count=2
+        if ($normLower -match '^-count(?:=(\d+))?$') {
+            if ($matches[1]) {
+                $script:Count = [uint]$matches[1]
+            }
+            else {
+                $i++
+                if ($i -ge $UnboundArgs.Count -or $UnboundArgs[$i] -notmatch '^\d+$') {
+                    throw "Missing numeric value for --count"
+                }
+                $script:Count = [uint]$UnboundArgs[$i]
+            }
+            continue
+        }
+
+        # --reviewer / --reviewer=username
+        if ($normLower -match '^-reviewer(?:=(.+))?$') {
+            if ($matches[1]) {
+                $script:Reviewer += $matches[1]
+            }
+            else {
+                $i++
+                if ($i -ge $UnboundArgs.Count -or -not $UnboundArgs[$i]) {
+                    throw "Missing value for --reviewer"
+                }
+                $script:Reviewer += $UnboundArgs[$i]
+            }
+            continue
+        }
+
+        if ($normLower -eq '-detail') {
+            $script:Detail = $true
+            continue
+        }
+
+        if ($normLower -eq '-no-rebase') {
+            $script:NoRebase = $true
+            continue
+        }
+
+        if ($normLower -eq '-help') {
+            $script:Command = 'help'
+            continue
+        }
+
+        # --amend-index / --amend-index=2 (used by `amend`)
+        if ($normLower -match '^-amend-index(?:=(\d+))?$') {
+            if ($matches[1]) {
+                $script:AmendIndex = [uint]$matches[1]
+            }
+            else {
+                $i++
+                if ($i -ge $UnboundArgs.Count -or $UnboundArgs[$i] -notmatch '^\d+$') {
+                    throw "Missing numeric value for --amend-index"
+                }
+                $script:AmendIndex = [uint]$UnboundArgs[$i]
+            }
+            continue
+        }
+    }
 }
 
 function Show-Help {
@@ -125,7 +231,8 @@ function Get-GitConfig {
                     }
                 }
             }
-        } catch {
+        }
+        catch {
             Write-Warning "Failed to parse .spr.yml: $_"
         }
     }
@@ -136,7 +243,8 @@ function Get-GitConfig {
         if ($remoteUrl -match 'github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$') {
             $Config.GitHubRepoOwner = $matches[1]
             $Config.GitHubRepoName = $matches[2] -replace '\.git$', ''
-        } elseif ($remoteUrl -match '([^/]+)/([^/]+?)(?:\.git)?$') {
+        }
+        elseif ($remoteUrl -match '([^/]+)/([^/]+?)(?:\.git)?$') {
             $Config.GitHubRepoOwner = $matches[1]
             $Config.GitHubRepoName = $matches[2] -replace '\.git$', ''
         }
@@ -171,7 +279,8 @@ function Invoke-GitCommand {
         $result = git $Command.Split(' ') 2>&1 | Out-String
         Set-Variable -Name $Output -Value $result -Scope 1
         return $LASTEXITCODE -eq 0
-    } else {
+    }
+    else {
         git $Command.Split(' ') 2>&1 | Out-Null
         return $LASTEXITCODE -eq 0
     }
@@ -187,6 +296,10 @@ function Add-CommitIDs {
     }
     
     Write-Host "Adding commit-ids to commits that don't have them..." -ForegroundColor Cyan
+
+    # Use the currently-running PowerShell executable for helper scripts.
+    # Avoids Windows PowerShell 5.1 UTF-8 BOM output which breaks git rebase todo parsing.
+    $currentPwsh = (Get-Process -Id $PID).Path
     
     # Create editor script that adds commit-id to commit messages
     $editorScript = Join-Path $env:TEMP "git-spr-add-commit-id.ps1"
@@ -209,18 +322,24 @@ if ($FilePath -like "*COMMIT_EDITMSG*") {
         $content += "`ncommit-id: $commitID`n"
         
         # Write back
-        [System.IO.File]::WriteAllText($FilePath, $content, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($FilePath, $content, (New-Object System.Text.UTF8Encoding $false))
     }
     exit 0
 }
 '@
-    $editorContent | Out-File -FilePath $editorScript -Encoding utf8
+    [System.IO.File]::WriteAllText($editorScript, $editorContent, (New-Object System.Text.UTF8Encoding $false))
     
     # Create sequence editor script that marks commits without IDs for reword
     $sequenceEditor = Join-Path $env:TEMP "git-spr-sequence-editor.ps1"
     $seqContent = @'
 param($FilePath)
-$content = Get-Content $FilePath
+# Read as bytes so we can reliably strip a UTF-8 BOM if present
+$raw = [System.IO.File]::ReadAllBytes($FilePath)
+if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) {
+    $raw = $raw[3..($raw.Length-1)]
+}
+$text = [System.Text.Encoding]::UTF8.GetString($raw)
+$content = $text -split "`n"
 $newContent = @()
 foreach ($line in $content) {
     if ($line -match '^pick ([a-f0-9]+)') {
@@ -235,9 +354,10 @@ foreach ($line in $content) {
         $newContent += $line
     }
 }
-$newContent | Out-File -FilePath $FilePath -Encoding utf8
+# Write without BOM; git will reject todo lines that start with a BOM character.
+[System.IO.File]::WriteAllText($FilePath, ($newContent -join "`n"), (New-Object System.Text.UTF8Encoding $false))
 '@
-    $seqContent | Out-File -FilePath $sequenceEditor -Encoding utf8
+    [System.IO.File]::WriteAllText($sequenceEditor, $seqContent, (New-Object System.Text.UTF8Encoding $false))
     
     try {
         # Save original editors
@@ -245,31 +365,42 @@ $newContent | Out-File -FilePath $FilePath -Encoding utf8
         $originalSeqEditor = $env:GIT_SEQUENCE_EDITOR
         
         # Set our custom editors
-        $env:GIT_EDITOR = "powershell -File `"$editorScript`""
-        $env:GIT_SEQUENCE_EDITOR = "powershell -File `"$sequenceEditor`""
+        $env:GIT_EDITOR = "`"$currentPwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$editorScript`""
+        $env:GIT_SEQUENCE_EDITOR = "`"$currentPwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$sequenceEditor`""
         
         # Run interactive rebase (will be automated by our editors)
         $rebaseCmd = "rebase -i $baseCommit"
         if (-not (Invoke-GitCommand $rebaseCmd)) {
             Write-Host "Rebase to add commit-ids encountered issues. You may need to add commit-ids manually." -ForegroundColor Yellow
+
+            # Don’t leave the repository in a broken in-progress rebase state.
+            $rebaseInProgress = (Test-Path .git/rebase-merge) -or (Test-Path .git/rebase-apply)
+            if ($rebaseInProgress) {
+                Write-Host "Aborting incomplete rebase..." -ForegroundColor Yellow
+                git rebase --abort 2>&1 | Out-Null
+            }
             return $false
         }
         
         Write-Host "✓ Successfully added commit-ids" -ForegroundColor Green
         return $true
-    } catch {
+    }
+    catch {
         Write-Host "Error adding commit-ids: $_" -ForegroundColor Red
         return $false
-    } finally {
+    }
+    finally {
         # Restore original editors
         if ($originalEditor) {
             $env:GIT_EDITOR = $originalEditor
-        } else {
+        }
+        else {
             Remove-Item Env:\GIT_EDITOR -ErrorAction SilentlyContinue
         }
         if ($originalSeqEditor) {
             $env:GIT_SEQUENCE_EDITOR = $originalSeqEditor
-        } else {
+        }
+        else {
             Remove-Item Env:\GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue
         }
         
@@ -288,7 +419,8 @@ function Get-LocalCommitStack {
         Write-Warning "Remote branch $remoteBranch does not exist. Using local commits only."
         $commitLog = ""
         Invoke-GitCommand "log --format=medium --no-color HEAD" -Output "commitLog" | Out-Null
-    } else {
+    }
+    else {
         # Get commits that are not in the remote branch
         $commitLog = ""
         if (-not (Invoke-GitCommand "log --format=medium --no-color $remoteBranch..HEAD" -Output "commitLog")) {
@@ -310,7 +442,8 @@ function Get-LocalCommitStack {
             $commitLog = ""
             Invoke-GitCommand "log --format=medium --no-color $remoteBranch..HEAD" -Output "commitLog" | Out-Null
             $commits = Parse-CommitLog $commitLog
-        } else {
+        }
+        else {
             # Fallback: generate IDs from hash (not ideal, but works)
             foreach ($commit in $commits) {
                 if (-not $commit.CommitID) {
@@ -356,10 +489,10 @@ function Parse-CommitLog {
             $commitScanOn = $true
             $currentCommit = @{
                 CommitHash = $hashMatch.Groups[1].Value
-                CommitID = ""
-                Subject = ""
-                Body = ""
-                WIP = $false
+                CommitID   = ""
+                Subject    = ""
+                Body       = ""
+                WIP        = $false
             }
             $subjectIndex = $i + 4
             continue
@@ -389,7 +522,8 @@ function Parse-CommitLog {
         if ($commitScanOn -and $currentCommit) {
             if ($i -eq $subjectIndex) {
                 $currentCommit.Subject = $line.Trim()
-            } elseif ($i -gt $subjectIndex) {
+            }
+            elseif ($i -gt $subjectIndex) {
                 if ($line.Trim() -ne "" -or $currentCommit.Body -ne "") {
                     $currentCommit.Body += $line.Trim() + "`n"
                 }
@@ -429,7 +563,8 @@ function Get-GitHubPRs {
         # Try to extract commit-id from branch name (spr/{base}/{commitID})
         if ($pr.headRefName -match '^spr/[^/]+/([a-f0-9]{8})$') {
             $pr | Add-Member -NotePropertyName "CommitID" -NotePropertyValue $matches[1] -Force
-        } else {
+        }
+        else {
             $pr | Add-Member -NotePropertyName "CommitID" -NotePropertyValue "" -Force
         }
     }
@@ -451,7 +586,8 @@ function Sync-CommitStackToGitHub {
             return $false
         }
         $shouldPop = $true
-    } else {
+    }
+    else {
         $shouldPop = $false
     }
     
@@ -509,7 +645,8 @@ function Sync-CommitStackToGitHub {
                     throw "Failed to push branch"
                 }
             }
-        } else {
+        }
+        else {
             # Atomic push
             $pushCmd = "push --force --atomic $($Config.GitHubRemote) " + ($refSpecs -join " ")
             if (-not (Invoke-GitCommand $pushCmd)) {
@@ -519,7 +656,8 @@ function Sync-CommitStackToGitHub {
         
         Write-Host "✓ Successfully pushed commits" -ForegroundColor Green
         return $true
-    } finally {
+    }
+    finally {
         if ($shouldPop) {
             Write-Host "Popping stash..." -ForegroundColor Yellow
             Invoke-GitCommand "stash pop" | Out-Null
@@ -631,7 +769,8 @@ function Update-PullRequests {
             }
             
             $prevPR = $pr
-        } else {
+        }
+        else {
             # Create new PR
             $baseBranch = if ($prevCommit) { Get-BranchNameFromCommit $prevCommit } else { $Config.GitHubBranch }
             
@@ -652,7 +791,8 @@ function Update-PullRequests {
                 }
                 $stackMarkdown += "- #NEW ⬅`n"
                 $body += $stackMarkdown
-            } elseif ($prevCommit -and $prMap.ContainsKey($prevCommit.CommitID)) {
+            }
+            elseif ($prevCommit -and $prMap.ContainsKey($prevCommit.CommitID)) {
                 $body += "`n`n---`n`n**Stack**:`n- #$($prMap[$prevCommit.CommitID].number)`n- #NEW ⬅`n"
             }
             
@@ -666,7 +806,7 @@ function Update-PullRequests {
             if ($LASTEXITCODE -eq 0) {
                 # Get the created PR number
                 Start-Sleep -Seconds 1
-                $newPRJson = gh pr view $branchName --json number,title,headRefName 2>$null
+                $newPRJson = gh pr view $branchName --json number, title, headRefName 2>$null
                 if ($newPRJson) {
                     $newPR = $newPRJson | ConvertFrom-Json
                     $newPR | Add-Member -NotePropertyName "CommitID" -NotePropertyValue $commit.CommitID -Force
@@ -684,7 +824,8 @@ function Update-PullRequests {
                     }
                     $prevPR = $newPR
                 }
-            } else {
+            }
+            else {
                 Write-Host "Failed to create PR: $prOutput" -ForegroundColor Red
             }
         }
@@ -724,7 +865,8 @@ function Show-PRStatus {
                 $sortedPRs += $prByCommitID[$commit.CommitID]
             }
         }
-    } else {
+    }
+    else {
         # No local commits ahead of base branch - show all PRs anyway
         # Try to sort by PR number or base branch relationship
         $prsByBase = @{}
@@ -765,7 +907,7 @@ function Show-PRStatus {
         }
         
         # Reverse to show newest first
-        $sortedPRs = $sortedPRs[($sortedPRs.Count-1)..0]
+        $sortedPRs = $sortedPRs[($sortedPRs.Count - 1)..0]
     }
     
     if ($sortedPRs.Count -eq 0) {
@@ -796,7 +938,8 @@ function Get-PRStatusString {
     
     $icons = if ($Config.StatusBitsEmojis) {
         @{ check = "✅"; cross = "❌"; pending = "⌛"; empty = "➖" }
-    } else {
+    }
+    else {
         @{ check = "v"; cross = "x"; pending = "."; empty = "-" }
     }
     
@@ -815,17 +958,20 @@ function Get-PRStatusString {
                 }
             }
             $status += if ($allPass) { $icons.check } else { $icons.cross }
-        } else {
+        }
+        else {
             $status += $icons.pending
         }
-    } else {
+    }
+    else {
         $status += $icons.empty
     }
     
     # Approval status
     if ($Config.RequireApproval) {
         $status += if ($PR.reviewDecision -eq "APPROVED") { $icons.check } else { $icons.cross }
-    } else {
+    }
+    else {
         $status += $icons.empty
     }
     
@@ -870,7 +1016,7 @@ function Merge-PullRequests {
         $prDetails = gh pr view $pr.number --json "mergeable,reviewDecision,statusCheckRollup" 2>$null | ConvertFrom-Json
         
         $isMergeable = $prDetails.mergeable -and
-            ($prDetails.reviewDecision -eq "APPROVED" -or -not $Config.RequireApproval)
+        ($prDetails.reviewDecision -eq "APPROVED" -or -not $Config.RequireApproval)
         
         if (-not $isMergeable) {
             $prIndex = $i - 1
@@ -886,7 +1032,8 @@ function Merge-PullRequests {
     if ($prIndex -eq -1) {
         if ($sortedPRs.Count -gt 0) {
             $prIndex = $sortedPRs.Count - 1
-        } else {
+        }
+        else {
             Write-Host "No mergeable pull requests." -ForegroundColor Yellow
             return
         }
@@ -928,16 +1075,42 @@ function Sync-Stack {
         return
     }
     
-    # Get the last PR's commit hash
-    $lastPR = $prs[-1]
-    $branchName = $lastPR.headRefName
+    # Sync based on the top-of-stack PR (newest commit in the stack).
+    # `Get-GitHubPRs` returns PRs unsorted, so use local commit order when possible.
+    $localCommits = Get-LocalCommitStack | Where-Object { -not $_.WIP }
+    $prByCommitID = @{}
+    foreach ($pr in $prs) {
+        if ($pr.CommitID) { $prByCommitID[$pr.CommitID] = $pr }
+    }
+
+    $topPR = $null
+    if ($localCommits.Count -gt 0) {
+        for ($i = $localCommits.Count - 1; $i -ge 0; $i--) {
+            $cid = $localCommits[$i].CommitID
+            if ($cid -and $prByCommitID.ContainsKey($cid)) {
+                $topPR = $prByCommitID[$cid]
+                break
+            }
+        }
+    }
+    if (-not $topPR) {
+        # Fallback: pick the highest PR number (usually newest)
+        $topPR = $prs | Sort-Object number -Descending | Select-Object -First 1
+    }
+
+    $branchName = $topPR.headRefName
     
     Write-Host "Syncing local stack with remote..." -ForegroundColor Cyan
-    Invoke-GitCommand "cherry-pick ..$branchName" | Out-Null
+    # Cherry-pick commits in the stack branch that are not yet in the base branch
+    $remoteBranch = "$($Config.GitHubRemote)/$($Config.GitHubBranch)"
+    $remoteStackBranch = "$($Config.GitHubRemote)/$branchName"
+    Invoke-GitCommand "fetch $($Config.GitHubRemote)" | Out-Null
+    Invoke-GitCommand "cherry-pick $remoteBranch..$remoteStackBranch --no-edit" | Out-Null
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ Stack synchronized" -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host "Failed to sync stack" -ForegroundColor Red
     }
 }
@@ -980,18 +1153,25 @@ function Amend-Commit {
         Write-Host " $number : $commitID : $($commit.Subject)" -ForegroundColor Gray
     }
     
-    # Prompt for commit to amend
-    if ($localCommits.Count -eq 1) {
-        $prompt = "Commit to amend (1): "
-    } else {
-        $prompt = "Commit to amend (1-$($localCommits.Count)): "
-    }
-    
-    $input = Read-Host $prompt
+    # Prompt for commit to amend (or accept non-interactive selection via --amend-index)
     $commitIndex = 0
-    if (-not [int]::TryParse($input, [ref]$commitIndex)) {
-        Write-Host "Invalid input" -ForegroundColor Red
-        return
+    if ($script:AmendIndex -gt 0) {
+        $commitIndex = [int]$script:AmendIndex
+        Write-Host "Commit to amend: $commitIndex (via --amend-index)" -ForegroundColor Gray
+    }
+    else {
+        if ($localCommits.Count -eq 1) {
+            $prompt = "Commit to amend (1): "
+        }
+        else {
+            $prompt = "Commit to amend (1-$($localCommits.Count)): "
+        }
+        
+        $selection = Read-Host $prompt
+        if (-not [int]::TryParse($selection, [ref]$commitIndex)) {
+            Write-Host "Invalid input" -ForegroundColor Red
+            return
+        }
     }
     
     if ($commitIndex -lt 1 -or $commitIndex -gt $localCommits.Count) {
@@ -1025,6 +1205,9 @@ function Amend-Commit {
     # Rebase with autosquash to automatically apply the fixup
     $remoteBranch = "$($Config.GitHubRemote)/$($Config.GitHubBranch)"
     Write-Host "Rebasing with autosquash to apply fixup..." -ForegroundColor Cyan
+
+    # Use the currently-running PowerShell executable for helper scripts (avoid BOM issues from Windows PowerShell).
+    $currentPwsh = (Get-Process -Id $PID).Path
     
     # Use GIT_SEQUENCE_EDITOR to automatically accept the rebase todo without BOM
     $originalSeqEditor = $env:GIT_SEQUENCE_EDITOR
@@ -1039,7 +1222,7 @@ $content = $content -replace '^\xEF\xBB\xBF', ''
 [System.IO.File]::WriteAllText($FilePath, $content, (New-Object System.Text.UTF8Encoding $false))
 exit 0
 '@
-    $seqContent | Out-File -FilePath $seqEditor -Encoding utf8
+    [System.IO.File]::WriteAllText($seqEditor, $seqContent, (New-Object System.Text.UTF8Encoding $false))
     
     # Use GIT_EDITOR to automatically accept commit messages
     $originalEditor = $env:GIT_EDITOR
@@ -1049,11 +1232,11 @@ param($FilePath)
 # Just accept the commit message as-is
 exit 0
 '@
-    $editorContent | Out-File -FilePath $editor -Encoding utf8
+    [System.IO.File]::WriteAllText($editor, $editorContent, (New-Object System.Text.UTF8Encoding $false))
     
     try {
-        $env:GIT_SEQUENCE_EDITOR = "powershell -File `"$seqEditor`""
-        $env:GIT_EDITOR = "powershell -File `"$editor`""
+        $env:GIT_SEQUENCE_EDITOR = "`"$currentPwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$seqEditor`""
+        $env:GIT_EDITOR = "`"$currentPwsh`" -NoProfile -ExecutionPolicy Bypass -File `"$editor`""
         
         # Run the rebase
         $rebaseOutput = ""
@@ -1085,13 +1268,15 @@ exit 0
                         # Still in progress, try again
                         $continueCount++
                         continue
-                    } else {
+                    }
+                    else {
                         Write-Host "Rebase needs attention. Check status with 'git status' and continue with 'git rebase --continue'" -ForegroundColor Yellow
                         return
                     }
                 }
                 $continueCount++
-            } else {
+            }
+            else {
                 Write-Host "Rebase in progress with uncommitted changes. Please resolve and run 'git rebase --continue'" -ForegroundColor Yellow
                 return
             }
@@ -1101,20 +1286,24 @@ exit 0
         $rebaseInProgress = (Test-Path .git/rebase-merge) -or (Test-Path .git/rebase-apply)
         if (-not $rebaseInProgress) {
             Write-Host "✓ Commit amended successfully" -ForegroundColor Green
-        } else {
+        }
+        else {
             Write-Host "Rebase still in progress after $maxContinues attempts. Please check with 'git status' and continue manually with 'git rebase --continue'" -ForegroundColor Yellow
             return
         }
-    } finally {
+    }
+    finally {
         # Restore original editors
         if ($originalSeqEditor) {
             $env:GIT_SEQUENCE_EDITOR = $originalSeqEditor
-        } else {
+        }
+        else {
             Remove-Item Env:\GIT_SEQUENCE_EDITOR -ErrorAction SilentlyContinue
         }
         if ($originalEditor) {
             $env:GIT_EDITOR = $originalEditor
-        } else {
+        }
+        else {
             Remove-Item Env:\GIT_EDITOR -ErrorAction SilentlyContinue
         }
         Remove-Item $seqEditor -ErrorAction SilentlyContinue
@@ -1125,6 +1314,7 @@ exit 0
 }
 
 # Main
+Resolve-LongOptions -UnboundArgs $RemainingArgs
 Get-GitConfig
 
 switch ($Command) {
