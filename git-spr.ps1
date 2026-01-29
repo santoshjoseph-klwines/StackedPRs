@@ -16,6 +16,9 @@ param(
     [switch]$Detail,
     [switch]$NoRebase,
 
+    # Create new PRs as drafts (only affects PRs created during this run).
+    [switch]$Draft,
+
     # Non-interactive support for `amend` (1-based index in displayed list).
     # Example: .\git-spr.ps1 amend --amend-index 2
     [uint]$AmendIndex = 0,
@@ -117,6 +120,11 @@ function Resolve-LongOptions {
             continue
         }
 
+        if ($normLower -eq '-draft') {
+            $script:Draft = $true
+            continue
+        }
+
         if ($normLower -eq '-help') {
             $script:Command = 'help'
             continue
@@ -172,6 +180,7 @@ OPTIONS:
     --reviewer USER    Add reviewer to newly created pull requests (can be specified multiple times)
     --detail           Show detailed status bits output
     --no-rebase        Skip rebasing on update (use SPR_NOREBASE env var)
+    --draft            Create new pull requests as drafts (update only)
 
 EXAMPLES:
     # Update all commits in stack to create/update PRs
@@ -801,6 +810,7 @@ function Update-PullRequests {
                 --body $body `
                 --base $baseBranch `
                 --head $branchName `
+            $(if ($script:Draft) { "--draft" }) `
                 2>&1
             
             if ($LASTEXITCODE -eq 0) {
@@ -858,15 +868,18 @@ function Show-PRStatus {
     $sortedPRs = @()
     
     if ($localCommits.Count -gt 0) {
-        # If we have local commits, match them to PRs
+        # If we have local commits, try to match them to PRs
         for ($i = $localCommits.Count - 1; $i -ge 0; $i--) {
             $commit = $localCommits[$i]
-            if ($prByCommitID.ContainsKey($commit.CommitID)) {
+            if ($commit.CommitID -and $prByCommitID.ContainsKey($commit.CommitID)) {
                 $sortedPRs += $prByCommitID[$commit.CommitID]
             }
         }
     }
-    else {
+    
+    # If we didn't match any PRs to local commits (either no local commits,
+    # or on a branch where commits don't match), show all PRs sorted by stack order
+    if ($sortedPRs.Count -eq 0) {
         # No local commits ahead of base branch - show all PRs anyway
         # Try to sort by PR number or base branch relationship
         $prsByBase = @{}
@@ -907,7 +920,9 @@ function Show-PRStatus {
         }
         
         # Reverse to show newest first
-        $sortedPRs = $sortedPRs[($sortedPRs.Count - 1)..0]
+        if ($sortedPRs.Count -gt 0) {
+            $sortedPRs = $sortedPRs[($sortedPRs.Count - 1)..0]
+        }
     }
     
     if ($sortedPRs.Count -eq 0) {
@@ -1004,7 +1019,7 @@ function Merge-PullRequests {
     
     $sortedPRs = @()
     foreach ($commit in $localCommits) {
-        if ($prByCommitID.ContainsKey($commit.CommitID)) {
+        if ($commit.CommitID -and $prByCommitID.ContainsKey($commit.CommitID)) {
             $sortedPRs += $prByCommitID[$commit.CommitID]
         }
     }

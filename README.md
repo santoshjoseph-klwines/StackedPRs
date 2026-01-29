@@ -37,6 +37,9 @@ This is a PowerShell implementation of [spr](https://github.com/ejoffe/spr) (Sta
 
 # Add reviewers to new PRs
 .\git-spr.ps1 update --reviewer username1 --reviewer username2
+
+# Create new PRs as drafts
+.\git-spr.ps1 update --draft
 ```
 
 ### Show Status
