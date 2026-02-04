@@ -756,8 +756,23 @@ function Update-PullRequests {
                 gh pr edit $pr.number --base $baseBranch 2>&1 | Out-Null
             }
             
-            # Update PR body with stack info
-            $body = $commit.Body
+            # Update PR body with stack info, preserving user content above ---
+            # Fetch existing PR body to preserve user edits
+            $existingBody = $pr.body
+            
+            # Extract user content above the --- separator (if any)
+            # This preserves any customizations the user made to the PR description
+            if ($existingBody -and $existingBody -match '(?s)^(.*?)(\r?\n---\r?\n|\r?\n\r?\n---\r?\n)') {
+                # User has content above ---, preserve it
+                $userContent = $matches[1].TrimEnd()
+            }
+            else {
+                # No --- separator found, use the commit body as default
+                # (This is the initial state or user deleted the separator)
+                $userContent = if ($existingBody) { $existingBody.TrimEnd() } else { $commit.Body }
+            }
+            
+            $body = $userContent
             if ($allStackPRs.Count -gt 1 -or $createdPRs.Count -gt 0) {
                 $stackMarkdown = "`n`n---`n`n**Stack**:`n"
                 # Add existing PRs
