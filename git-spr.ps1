@@ -699,22 +699,52 @@ function Update-PullRequests {
     }
     
     # Filter out WIP commits
-    $commitsToProcess = $localCommits | Where-Object { -not $_.WIP }
+    $allActiveCommits = $localCommits | Where-Object { -not $_.WIP }
+    $commitsToProcess = $allActiveCommits
     if ($Count -gt 0) {
         $commitsToProcess = $commitsToProcess[0..([Math]::Min($Count - 1, $commitsToProcess.Count - 1))]
     }
     
     # Close PRs for deleted commits
-    $commitIDMap = @{}
-    foreach ($commit in $commitsToProcess) {
-        $commitIDMap[$commit.CommitID] = $commit
+    # IMPORTANT: this must use the full active local stack (not --count-limited commits),
+    # otherwise update --count can accidentally close valid PRs above the requested range.
+    $allCommitIDMap = @{}
+    foreach ($commit in $allActiveCommits) {
+        if ($commit.CommitID) {
+            $allCommitIDMap[$commit.CommitID] = $commit
+        }
+    }
+
+    # If there are open PRs that are based on our local top commit branch but whose commit-id
+    # is not present locally, we're likely on a mid-stack branch. In that case, never auto-close
+    # "missing" PRs because they belong to downstream stack commits.
+    $hasDownstreamPRs = $false
+    if ($allActiveCommits.Count -gt 0) {
+        $topLocalCommit = $allActiveCommits[$allActiveCommits.Count - 1]
+        $topLocalBranch = Get-BranchNameFromCommit $topLocalCommit
+        foreach ($pr in $existingPRs) {
+            if (
+                $pr.baseRefName -eq $topLocalBranch -and
+                $pr.CommitID -and
+                -not $allCommitIDMap.ContainsKey($pr.CommitID)
+            ) {
+                $hasDownstreamPRs = $true
+                break
+            }
+        }
+    }
+
+    if ($hasDownstreamPRs) {
+        Write-Host "Detected downstream PRs beyond current branch; skipping auto-close of missing commits." -ForegroundColor Yellow
     }
     
-    foreach ($pr in $existingPRs) {
-        if ($pr.CommitID -and -not $commitIDMap.ContainsKey($pr.CommitID)) {
-            Write-Host "Closing PR #$($pr.number): commit has gone away" -ForegroundColor Yellow
-            gh pr comment $pr.number --body "Closing pull request: commit has gone away" 2>&1 | Out-Null
-            gh pr close $pr.number 2>&1 | Out-Null
+    if (-not $hasDownstreamPRs) {
+        foreach ($pr in $existingPRs) {
+            if ($pr.CommitID -and -not $allCommitIDMap.ContainsKey($pr.CommitID)) {
+                Write-Host "Closing PR #$($pr.number): commit has gone away" -ForegroundColor Yellow
+                gh pr comment $pr.number --body "Closing pull request: commit has gone away" 2>&1 | Out-Null
+                gh pr close $pr.number 2>&1 | Out-Null
+            }
         }
     }
     
@@ -1087,10 +1117,28 @@ function Merge-PullRequests {
         # Close PRs below
         for ($i = 0; $i -lt $prIndex; $i++) {
             $pr = $sortedPRs[$i]
-            $comment = "✓ Commit merged in pull request [#$($prToMerge.number)]($prToMerge.url)"
+            $comment = "Commit merged in pull request [#$($prToMerge.number)]($prToMerge.url)"
             gh pr comment $pr.number --body $comment 2>&1 | Out-Null
             gh pr close $pr.number 2>&1 | Out-Null
             Write-Host "MERGED #$($pr.number) $($pr.title)" -ForegroundColor Green
+        }
+
+        # Re-stack remaining PRs so merged commits are dropped from diffs.
+        # This is especially important after rebase/squash merges where commit SHAs change on base.
+        $remainingCount = $sortedPRs.Count - ($prIndex + 1)
+        if ($remainingCount -gt 0) {
+            Write-Host "Restacking $remainingCount remaining PR(s) on $($Config.GitHubBranch)..." -ForegroundColor Cyan
+
+            # Always rebase when restacking after merge, regardless of --no-rebase.
+            $originalNoRebase = $script:NoRebase
+            $script:NoRebase = $false
+            try {
+                Update-PullRequests -Reviewers @()
+            }
+            finally {
+                $script:NoRebase = $originalNoRebase
+            }
+            return
         }
     }
     
